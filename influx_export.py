@@ -2,15 +2,21 @@
 """
  @author Johannes Aalto
  SPDX-License-Identifier: Apache-2.0
+
+ Modified by: Kyle Mishanec
 """
 
 import os
+import warnings
 
 import pandas as pd
 import requests
 
 from typing import Iterable, Dict, List
 from influxdb_client import InfluxDBClient
+from influxdb_client.client.warnings import MissingPivotFunction
+
+warnings.simplefilter("ignore", MissingPivotFunction)
 
 
 try:
@@ -62,11 +68,19 @@ def main(args: Dict[str, str]):
     print("args: " + str(args.keys()))
     bucket = args.pop("bucket")
     url = args.pop("vm_addr")
+    start = int(args.pop("start"))
+    end = int(args.pop("end"))
+    chunk_hours = int(args.pop("chunk_hours"))
 
     for k, v in args.items():
         if v is not None:
             os.environ[k] = v
         print(f"Using {k}={os.getenv(k)}")
+
+    chunk_seconds = chunk_hours * 3600
+    total_seconds = end - start
+    total_chunks = (total_seconds + chunk_seconds - 1) // chunk_seconds
+    print(f"Time range: start={start}, stop={end} ({total_seconds}s, {total_chunks} chunks of {chunk_hours}h)")
 
     client = InfluxDBClient.from_env_properties()
 
@@ -76,30 +90,51 @@ def main(args: Dict[str, str]):
     # With latest InfluxDB we could possibly use "schema.measurements()" but this doesn't exist in 2.0
     first_in_series = f"""
     from(bucket: "{bucket}")
-    |> range(start: 0, stop: now())
+    |> range(start: {start}, stop: {end})
     |> first()"""
     timeseries: List[pd.DataFrame] = query_api.query_data_frame(first_in_series)
 
+    if isinstance(timeseries, pd.DataFrame):
+        timeseries = [timeseries]
+
     # get all unique measurement-field pairs and then fetch and export them one-by-one.
-    # With really large databases the results should be possibly split further
-    # Something like query_data_frame_stream() might be then useful.
     measurements_and_fields = [
         gr[0] for df in timeseries for gr in df.groupby(["_measurement", "_field"])
     ]
     print(f"Found {len(measurements_and_fields)} unique time series")
     for meas, field in measurements_and_fields:
         print(f"Exporting {meas}_{field}")
-        whole_series = f"""
-        from(bucket: "{bucket}")
-        |> range(start: 0, stop: now())
-        |> filter(fn: (r) => r["_measurement"] == "{meas}")
-        |> filter(fn: (r) => r["_field"] == "{field}")
-        """
-        df = query_api.query_data_frame(whole_series)
 
-        line = get_influxdb_lines(df)
-        # "db" is added as an extra tag for the value.
-        requests.post(f"{url}/write?db={bucket}", data=line)
+        chunk_start = start
+        chunk_num = 0
+        while chunk_start < end:
+            chunk_stop = min(chunk_start + chunk_seconds, end)
+            chunk_num += 1
+            print(f"  Chunk {chunk_num}/{total_chunks}: {chunk_start} -> {chunk_stop}")
+
+            whole_series = f"""
+            from(bucket: "{bucket}")
+            |> range(start: {chunk_start}, stop: {chunk_stop})
+            |> filter(fn: (r) => r["_measurement"] == "{meas}")
+            |> filter(fn: (r) => r["_field"] == "{field}")
+            """
+            df = query_api.query_data_frame(whole_series)
+            if isinstance(df, list):
+                df = pd.concat(df, ignore_index=True)
+
+            if df.empty or "_measurement" not in df.columns:
+                chunk_start = chunk_stop
+                continue
+
+            line = get_influxdb_lines(df)
+            # "db" is added as an extra tag for the value.
+            resp = requests.post(f"{url}/influx/api/v2/write", data=line)
+            if resp.status_code != 204:
+                print(f"    Warning: write returned {resp.status_code}: {resp.text}")
+
+            chunk_start = chunk_stop
+
+        print(f"  Done exporting {meas}_{field}")
 
 
 if __name__ == "__main__":
@@ -159,5 +194,26 @@ if __name__ == "__main__":
         "-a",
         type=str,
         help="VictoriaMetrics server",
+    )
+    parser.add_argument(
+        "--start",
+        "-s",
+        type=int,
+        required=True,
+        help="Range start as unix timestamp (e.g., 1641013200)",
+    )
+    parser.add_argument(
+        "--end",
+        "-e",
+        type=int,
+        required=True,
+        help="Range stop as unix timestamp (e.g., 1672549199)",
+    )
+    parser.add_argument(
+        "--chunk-hours",
+        "-c",
+        type=int,
+        default=1,
+        help="Hours per chunk for writing to VictoriaMetrics (default: 1)",
     )
     main(vars(parser.parse_args()))
