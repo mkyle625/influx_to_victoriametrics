@@ -36,6 +36,11 @@ def get_tag_cols(dataframe_keys: Iterable) -> Iterable:
     )
 
 
+def escape_tag_value(series: pd.Series) -> pd.Series:
+    """Escape special characters in tag values per InfluxDB line protocol."""
+    return series.astype(str).str.replace(" ", "\\ ", regex=False).str.replace(",", "\\,", regex=False).str.replace("=", "\\=", regex=False)
+
+
 def get_influxdb_lines(df: pd.DataFrame) -> str:
     """
     Convert the Pandas Dataframe into InfluxDB line protocol.
@@ -48,10 +53,10 @@ def get_influxdb_lines(df: pd.DataFrame) -> str:
 
     Protocol description: https://docs.influxdata.com/influxdb/v2.0/reference/syntax/line-protocol/
     """
-    line = df["_measurement"]
+    line = escape_tag_value(df["_measurement"])
 
     for col_name in get_tag_cols(df):
-        line += ("," + col_name + "=") + df[col_name].astype(str)
+        line += ("," + col_name + "=") + escape_tag_value(df[col_name])
 
     line += (
         " "
